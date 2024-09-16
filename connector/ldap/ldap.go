@@ -3,8 +3,11 @@ package ldap
 
 import (
 	"context"
+	"crypto/sha1"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -413,75 +416,121 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 	return ident, nil
 }
 
-func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.Entry, found bool, err error) {
+func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.Entry, passwordDN string, found bool, err error) {
+	// Construct the search filter
 	filter := fmt.Sprintf("(%s=%s)", c.UserSearch.Username, ldap.EscapeFilter(username))
 	if c.UserSearch.Filter != "" {
 		filter = fmt.Sprintf("(&%s%s)", c.UserSearch.Filter, filter)
 	}
 
-	// Initial search.
+	// Define the search request for the user entry
 	req := &ldap.SearchRequest{
 		BaseDN: c.UserSearch.BaseDN,
 		Filter: filter,
 		Scope:  c.userSearchScope,
-		// We only need to search for these specific requests.
 		Attributes: []string{
 			c.UserSearch.IDAttr,
 			c.UserSearch.EmailAttr,
-			// TODO(ericchiang): what if this contains duplicate values?
+			// Add any additional attributes you need
 		},
 	}
 
-	for _, matcher := range c.GroupSearch.UserMatchers {
-		req.Attributes = append(req.Attributes, matcher.UserAttr)
-	}
-
+	// Include name attributes if configured
 	if c.UserSearch.NameAttr != "" {
 		req.Attributes = append(req.Attributes, c.UserSearch.NameAttr)
 	}
-
 	if c.UserSearch.PreferredUsernameAttrAttr != "" {
 		req.Attributes = append(req.Attributes, c.UserSearch.PreferredUsernameAttrAttr)
 	}
 
-	c.logger.Info("performing ldap search",
-		"base_dn", req.BaseDN, "scope", scopeString(req.Scope), "filter", req.Filter)
+	c.logger.Info("performing ldap search", "base_dn", req.BaseDN, "scope", scopeString(req.Scope), "filter", req.Filter)
 	resp, err := conn.Search(req)
 	if err != nil {
-		return ldap.Entry{}, false, fmt.Errorf("ldap: search with filter %q failed: %v", req.Filter, err)
+		return ldap.Entry{}, "", false, fmt.Errorf("ldap: search with filter %q failed: %v", req.Filter, err)
 	}
 
 	switch n := len(resp.Entries); n {
 	case 0:
 		c.logger.Error("no results returned for filter", "filter", filter)
-		return ldap.Entry{}, false, nil
+		return ldap.Entry{}, "", false, nil
 	case 1:
 		user = *resp.Entries[0]
 		c.logger.Info("username mapped to entry", "username", username, "user_dn", user.DN)
-		return user, true, nil
+
+		// Search for the password sub-object within the user entry
+		passwordFilter := "(objectClass=ubiloginAuthMethod)"
+		passwordReq := &ldap.SearchRequest{
+			BaseDN:     user.DN,
+			Filter:     passwordFilter,
+			Scope:      ldap.ScopeSingleLevel, // Only search immediate children
+			Attributes: []string{"cn"},        // Attributes to retrieve
+		}
+
+		passwordResp, err := conn.Search(passwordReq)
+		if err != nil {
+			return ldap.Entry{}, "", false, fmt.Errorf("ldap: password sub-object search failed: %v", err)
+		}
+
+		if len(passwordResp.Entries) != 1 {
+			c.logger.Error("password sub-object not found or multiple found", "count", len(passwordResp.Entries))
+			return ldap.Entry{}, "", false, fmt.Errorf("ldap: expected exactly one password sub-object, found %d", len(passwordResp.Entries))
+		}
+
+		passwordDN = passwordResp.Entries[0].DN
+		return user, passwordDN, true, nil
+
 	default:
-		return ldap.Entry{}, false, fmt.Errorf("ldap: filter returned multiple (%d) results: %q", n, filter)
+		return ldap.Entry{}, "", false, fmt.Errorf("ldap: filter returned multiple (%d) results: %q", n, filter)
 	}
 }
 
-func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username, password string) (ident connector.Identity, validPass bool, err error) {
-	// make this check to avoid unauthenticated bind to the LDAP server.
+func verifySSHA(password string, hash string) bool {
+	// Remove the SSHA prefix
+	if !strings.HasPrefix(hash, "{SSHA}") {
+		return false
+	}
+	hash = strings.TrimPrefix(hash, "{SSHA}")
 
+	// Decode the base64 hash
+	decoded, err := base64.StdEncoding.DecodeString(hash)
+	if err != nil {
+		return false
+	}
+
+	// SSHA consists of SHA1(password + salt) + salt
+	if len(decoded) < 20 { // SHA1 hash is 20 bytes
+		return false
+	}
+
+	sha1Hash := decoded[:20]
+	salt := decoded[20:]
+
+	// Compute SHA1(password + salt)
+	h := sha1.New()
+	h.Write([]byte(password))
+	h.Write(salt)
+	computedHash := h.Sum(nil)
+
+	// Compare the computed hash with the stored hash
+	return subtle.ConstantTimeCompare(sha1Hash, computedHash) == 1
+}
+
+func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username, password string) (ident connector.Identity, validPass bool, err error) {
 	if password == "" {
 		return connector.Identity{}, false, nil
 	}
 
 	var (
-		// We want to return a different error if the user's password is incorrect vs
-		// if there was an error.
 		incorrectPass = false
 		user          ldap.Entry
+		passwordDN    string
 	)
 
 	username = ldap.EscapeFilter(username)
 
 	err = c.do(ctx, func(conn *ldap.Conn) error {
-		entry, found, err := c.userEntry(conn, username)
+		// Capture all four return values from userEntry
+		entry, pwdDN, found, err := c.userEntry(conn, username)
 		if err != nil {
 			return err
 		}
@@ -490,26 +539,46 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 			return nil
 		}
 		user = entry
+		passwordDN = pwdDN
 
-		// Try to authenticate as the distinguished name.
-		if err := conn.Bind(user.DN, password); err != nil {
-			// Detect a bad password through the LDAP error code.
-			if ldapErr, ok := err.(*ldap.Error); ok {
-				switch ldapErr.ResultCode {
-				case ldap.LDAPResultInvalidCredentials:
-					c.logger.Error("invalid password for user", "user_dn", user.DN)
-					incorrectPass = true
-					return nil
-				case ldap.LDAPResultConstraintViolation:
-					c.logger.Error("constraint violation for user", "user_dn", user.DN, "err", ldapErr.Error())
-					incorrectPass = true
-					return nil
-				}
-			} // will also catch all ldap.Error without a case statement above
-			return fmt.Errorf("ldap: failed to bind as dn %q: %v", user.DN, err)
+		// Define the search request to retrieve the hashed password
+		passwordReq := &ldap.SearchRequest{
+			BaseDN:     passwordDN,
+			Filter:     "(objectClass=ubiloginAuthMethod)", // Adjust if needed
+			Scope:      ldap.ScopeBaseObject,               // Only search the specific DN
+			Attributes: []string{"ubiloginConfString"},     // Attribute containing the hashed password
 		}
+
+		passwordResp, err := conn.Search(passwordReq)
+		if err != nil {
+			return fmt.Errorf("ldap: failed to read password entry: %v", err)
+		}
+
+		if len(passwordResp.Entries) != 1 {
+			return fmt.Errorf("ldap: expected exactly one password entry, found %d", len(passwordResp.Entries))
+		}
+
+		var storedHash string
+		for _, attr := range passwordResp.Entries[0].Attributes {
+			if attr.Name == "ubiloginConfString" && len(attr.Values) > 0 {
+				storedHash = attr.Values[0]
+				break
+			}
+		}
+
+		if storedHash == "" {
+			return fmt.Errorf("ldap: ubiloginConfString not found in password entry")
+		}
+
+		// Verify the password against the stored SSHA hash
+		if !verifySSHA(password, storedHash) {
+			incorrectPass = true
+			return nil
+		}
+
 		return nil
 	})
+
 	if err != nil {
 		return connector.Identity{}, false, err
 	}
@@ -517,10 +586,12 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 		return connector.Identity{}, false, nil
 	}
 
+	// Populate the identity from the user entry
 	if ident, err = c.identityFromEntry(user); err != nil {
 		return connector.Identity{}, false, err
 	}
 
+	// Retrieve groups if requested
 	if s.Groups {
 		groups, err := c.groups(ctx, user)
 		if err != nil {
@@ -529,13 +600,12 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 		ident.Groups = groups
 	}
 
+	// Handle offline access scopes
 	if s.OfflineAccess {
 		refresh := refreshData{
 			Username: username,
 			Entry:    user,
 		}
-		// Encode entry for follow up requests such as the groups query and
-		// refresh attempts.
 		if ident.ConnectorData, err = json.Marshal(refresh); err != nil {
 			return connector.Identity{}, false, fmt.Errorf("ldap: marshal entry: %v", err)
 		}
@@ -552,7 +622,7 @@ func (c *ldapConnector) Refresh(ctx context.Context, s connector.Scopes, ident c
 
 	var user ldap.Entry
 	err := c.do(ctx, func(conn *ldap.Conn) error {
-		entry, found, err := c.userEntry(conn, data.Username)
+		entry, _, found, err := c.userEntry(conn, data.Username)
 		if err != nil {
 			return err
 		}
